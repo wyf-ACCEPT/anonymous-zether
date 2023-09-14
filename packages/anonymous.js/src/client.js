@@ -8,6 +8,53 @@ const bn128 = require('./utils/bn128.js');
 
 const sleep = (wait) => new Promise((resolve) => { setTimeout(resolve, wait); });
 
+function customShuffle(array, f) {
+    const n = array.length
+    if (2 * (f - 1) > n)
+        throw "Invalid value for f."
+
+    const oddGroup = [array[0]]
+    const evenGroup = array.slice(1, f + 1)
+    for (let i = f + 1; i < n / 2 + 1; i++)
+        evenGroup.push(array[i])
+    for (let i = n / 2 + 1; i < n; i++)
+        oddGroup.push(array[i])
+
+    let temp
+    const oddPosition = Array.from({ length: oddGroup.length }, (_, i) => i)
+    for (let i = oddGroup.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        temp = oddGroup[i]; oddGroup[i] = oddGroup[j]; oddGroup[j] = temp
+        temp = oddPosition[i]; oddPosition[i] = oddPosition[j]; oddPosition[j] = temp
+    }
+    const evenPosition = Array.from({ length: evenGroup.length }, (_, i) => i)
+    for (let i = evenGroup.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        temp = evenGroup[i]; evenGroup[i] = evenGroup[j]; evenGroup[j] = temp
+        temp = evenPosition[i]; evenPosition[i] = evenPosition[j]; evenPosition[j] = temp
+    }
+
+    console.log('oddPosition  :', oddPosition, oddGroup)
+    console.log('evenPosition :', evenPosition, evenGroup)
+
+    const [shuffledArray, positions] = [[], []]
+    const indices = Array(n).fill(0)
+    for (let i = 0; i * 2 < n; i++) {
+        shuffledArray.push(oddGroup[i]); positions.push(oddPosition[i]==0 ? 0 : oddPosition[i] + n/2)
+        shuffledArray.push(evenGroup[i]); positions.push(evenPosition[i] + 1)
+        indices[evenPosition[i] + 1] = i * 2 + 1
+        indices[oddPosition[i]==0 ? 0 : oddPosition[i] + n/2] = i * 2
+    }
+    return { shuffledArray, indices, positions }
+}
+
+function reverseIndices(indices) {
+    const n = indices.length
+    const newIndices = Array(n).fill(0)
+    for (let i = 0; i < n; i++) newIndices[indices[i]] = i
+    return newIndices
+}
+
 class Client {
     constructor(web3, zsc, home) {
         if (web3 === undefined)
@@ -80,7 +127,7 @@ class Client {
                 console.log(error); // when will this be called / fired...?! confusing. also, test this.
             });
 
-        this.account = new function() {
+        this.account = new function () {
             this.keypair = undefined;
             this._state = {
                 available: 0,
@@ -108,7 +155,7 @@ class Client {
             this.secret = () => "0x" + this.keypair['x'].toString(16, 64);
         };
 
-        this.friends = new function() {
+        this.friends = new function () {
             const friends = {};
             this.add = (name, pubkey) => {
                 // todo: checks that these are properly formed, of the right types, etc...
@@ -183,32 +230,38 @@ class Client {
             });
         };
 
-        this.transfer = (name, value, decoys, beneficiary) => { // todo: make sure the beneficiary is registered.
+        this.transferBatch = (names, values, decoys, beneficiary) => { // todo: make sure the beneficiary is registered.
             if (this.account.keypair === undefined)
                 throw "Client's account is not yet registered!";
-            decoys = decoys ? decoys : [];
+            if (decoys.length < names.length - 1)
+                throw `The length of decoys must be at least ${names.length - 1} to satisfy the new condition.`;
+            if (names.length !== values.length)
+                throw "The lengths of names and values must be equal.";
+
             const account = this.account;
             const state = account._simulate();
-            if (value + fee > state.available + state.pending)
-                throw "Requested transfer amount of " + value + " (plus fee of " + fee + ") exceeds account balance of " + (state.available + state.pending) + ".";
+            const totalValue = values.reduce((a, b) => a + b, 0);
+            if (totalValue + fee > state.available + state.pending)
+                throw "Requested total transfer amount of " + totalValue + " (plus fee of " + fee + ") exceeds account balance of " + (state.available + state.pending) + ".";
+
             const wait = away();
             const seconds = Math.ceil(wait / 1000);
             const plural = seconds === 1 ? "" : "s";
-            if (value > state.available) {
+            if (totalValue > state.available) {
                 console.log("Your transfer has been queued. Please wait " + seconds + " second" + plural + ", for the release of your funds...");
-                return sleep(wait).then(() => this.transfer(name, value, decoys, beneficiary));
+                return sleep(wait).then(() => this.transferBatch(names, values, decoys, beneficiary));
             }
             if (state.nonceUsed) {
                 console.log("Your transfer has been queued. Please wait " + seconds + " second" + plural + ", until the next epoch...");
-                return sleep(wait).then(() => this.transfer(name, value, decoys, beneficiary));
+                return sleep(wait).then(() => this.transferBatch(names, values, decoys, beneficiary));
             }
-            const size = 2 + decoys.length;
+            const size = 1 + names.length + decoys.length;
             const estimated = estimate(size, false); // see notes above
             if (estimated > epochLength * 1000)
                 throw "The anonset size (" + size + ") you've requested might take longer than the epoch length (" + epochLength + " seconds) to prove. Consider re-deploying, with an epoch length at least " + Math.ceil(estimate(size, true) / 1000) + " seconds.";
             if (estimated > wait) {
                 console.log(wait < 3100 ? "Initiating transfer." : "Your transfer has been queued. Please wait " + seconds + " second" + plural + ", until the next epoch...");
-                return sleep(wait).then(() => this.transfer(name, value, decoys, beneficiary));
+                return sleep(wait).then(() => this.transferBatch(names, values, decoys, beneficiary));
             }
             if (size & (size - 1)) {
                 let previous = 1;
@@ -219,12 +272,16 @@ class Client {
                 }
                 throw "Anonset's size (including you and the recipient) must be a power of two. Add " + (next - size) + " or remove " + (size - previous) + ".";
             }
+
             const friends = this.friends.show();
-            if (!(name in friends))
-                throw "Name \"" + name + "\" hasn't been friended yet!";
-            if (account.keypair['y'].eq(friends[name]))
-                throw "Sending to yourself is currently unsupported (and useless!)."
-            const y = [account.keypair['y'], friends[name]]; // not yet shuffled
+            const y = [account.keypair['y']]
+            names.forEach(name => {
+                if (!(name in friends))
+                    throw "Name \"" + name + "\" hasn't been friended yet!";
+                if (account.keypair['y'].eq(friends[name]))
+                    throw "Sending to yourself is currently unsupported (and useless!)."
+                y.push(friends[name]);
+            });
             decoys.forEach((decoy) => {
                 if (!(decoy in friends))
                     throw "Decoy \"" + decoy + "\" is unknown in friends directory!";
@@ -232,22 +289,17 @@ class Client {
             });
             if (beneficiary !== undefined && !(beneficiary in friends))
                 throw "Beneficiary \"" + beneficiary + "\" is not known!";
-            const index = [];
-            let m = y.length;
-            while (m !== 0) { // https://bost.ocks.org/mike/shuffle/
-                const i = crypto.randomBytes(1).readUInt8() % m--; // warning: N should be <= 256. also modulo bias.
-                const temp = y[i];
-                y[i] = y[m];
-                y[m] = temp;
-                if (account.keypair['y'].eq(temp)) index[0] = m;
-                else if (friends[name].eq(temp)) index[1] = m;
-            } // shuffle the array of y's
-            if (index[0] % 2 === index[1] % 2) {
-                const temp = y[index[1]];
-                y[index[1]] = y[index[1] + (index[1] % 2 === 0 ? 1 : -1)];
-                y[index[1] + (index[1] % 2 === 0 ? 1 : -1)] = temp;
-                index[1] = index[1] + (index[1] % 2 === 0 ? 1 : -1);
-            } // make sure you and your friend have opposite parity
+
+            const f = names.length
+            const { shuffledArray: y_shuffled, indices: index } = customShuffle(y, f)
+            const newIndex = reverseIndices(index)
+
+            // For example: 
+            // y = ['me', 'friend-0', 'friend-1', 'friend-2', 'decoy-0', 'decoy-1', 'decoy-2', 'decoy-3']
+            // y_shuffled = ['decoy-3', 'friend-2', 'decoy-2', 'decoy-0', 'me', 'friend-2', 'decoy-1', 'friend-1']
+            // index = [4, 1, 7, 5, 3, 6, 2, 0]
+            // newIndex = [7, 1, 6, 4, 0, 3, 5, 2]
+
             return new Promise((resolve, reject) => {
                 zsc.methods.simulateAccounts(y.map(bn128.serialize), getEpoch()).call().then((result) => {
                     const deserialized = result.map((account) => ElGamal.deserialize(account));
@@ -255,12 +307,14 @@ class Client {
                         return reject(new Error("Please make sure all parties (including decoys) are registered.")); // todo: better error message, i.e., which friend?
                     const r = bn128.randomScalar();
                     const D = bn128.curve.g.mul(r);
-                    const C = y.map((party, i) => {
-                        const left = ElGamal.base['g'].mul(new BN(i === index[0] ? -value - fee : i === index[1] ? value : 0)).add(party.mul(r))
+                    const C = y_shuffled.map((party, i) => {
+                        // const delta = i === index[0] ? - value - fee : i === index[1] ? value : 0
+                        const delta = newIndex[i] === 0 ? - totalValue - fee : newIndex[i] < f + 1 ? values[newIndex[i]-1] : 0
+                        const left = ElGamal.base['g'].mul(new BN(delta)).add(party.mul(r))
                         return new ElGamal(left, D)
                     });
                     const Cn = deserialized.map((account, i) => account.add(C[i]));
-                    const proof = Service.proveTransfer(Cn, C, y, state.lastRollOver, account.keypair['x'], r, value, state.available - value - fee, index, fee);
+                    const proof = Service.proveTransfer(Cn, C, y, state.lastRollOver, account.keypair['x'], r, totalValue, state.available - totalValue - fee, index, fee);
                     const u = utils.u(state.lastRollOver, account.keypair['x']);
                     const throwaway = web3.eth.accounts.create();
                     const beneficiaryKey = beneficiary === undefined ? bn128.zero : friends[beneficiary];
@@ -275,8 +329,8 @@ class Client {
                             .on('receipt', (receipt) => {
                                 account._state = account._simulate(); // have to freshly call it
                                 account._state.nonceUsed = true;
-                                account._state.pending -= value + fee;
-                                console.log("Transfer of " + value + " (with fee of " + fee + ") was successful. Balance now " + (account._state.available + account._state.pending) + ".");
+                                account._state.pending -= totalValue + fee;
+                                console.log("Transfer total of " + totalValue + " (with fee of " + fee + ") was successful. Balance now " + (account._state.available + account._state.pending) + ".");
                                 resolve(receipt);
                             })
                             .on('error', (error) => {
